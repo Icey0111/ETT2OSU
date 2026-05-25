@@ -334,8 +334,112 @@ def generate_timing_points(bpms: list, stops: list, offset: float) -> list:
 
 
 # ---------------------------------------------------------------------------
-#  Note converter
+#  NPS-based MSD estimator  (used when SM meter values are corrupted)
 # ---------------------------------------------------------------------------
+
+def estimate_msd(measures: list, bpms: list, stops: list, offset: float) -> float:
+    """
+    Estimate an MSD-like difficulty value from note density.
+
+    Uses peak NPS (notes-per-second) measured over a 2-second rolling window,
+    blended with the sustained density of the hardest 10% of the chart.
+    The result is mapped to an approximate MSD scale.
+
+    This is NOT a replacement for Etterna's full MinaCalc -- it is a quick
+    heuristic that gives a useful ballpark when the SM file's meter field
+    contains junk placeholder values.
+    """
+    # Collect timestamps for every note (taps + hold/roll heads)
+    timestamps: list = []
+    for m_idx, rows in enumerate(measures):
+        n_rows = len(rows)
+        if n_rows == 0:
+            continue
+        for r_idx, row in enumerate(rows):
+            beat = m_idx * 4.0 + r_idx * 4.0 / n_rows
+            note_count = sum(1 for c in row[:4] if c in "124")
+            if note_count > 0:
+                ms = beat_to_ms(beat, bpms, stops, offset)
+                for _ in range(note_count):
+                    timestamps.append(ms)
+
+    if len(timestamps) < 4:
+        return 1.0
+
+    timestamps.sort()
+
+    # ---- Peak NPS over a 2-second rolling window ----
+    window_ms = 2000.0
+    max_nps = 0.0
+    j = 0
+    for i in range(len(timestamps)):
+        while j < len(timestamps) and timestamps[j] - timestamps[i] <= window_ms:
+            j += 1
+        nps = (j - i) / (window_ms / 1000.0)
+        if nps > max_nps:
+            max_nps = nps
+
+    # ---- Sustained density: top 10% of 5-second windows ----
+    window_5s = 5000.0
+    nps_segments: list = []
+    j = 0
+    for i in range(0, len(timestamps), max(1, len(timestamps) // 100)):
+        while j < len(timestamps) and timestamps[j] - timestamps[i] <= window_5s:
+            j += 1
+        nps_segments.append((j - i) / (window_5s / 1000.0))
+
+    if nps_segments:
+        nps_segments.sort(reverse=True)
+        top_n = max(1, len(nps_segments) // 10)
+        sustained_nps = sum(nps_segments[:top_n]) / top_n
+    else:
+        sustained_nps = 0.0
+
+    # ---- Blend: 60% peak, 40% sustained ----
+    effective_nps = max_nps * 0.6 + sustained_nps * 0.4
+
+    # ---- Map to MSD-like scale ----
+    # Rough calibration based on observed Etterna charts:
+    #   ~4  NPS  ->  MSD ~10       (easy streams)
+    #   ~8  NPS  ->  MSD ~17       (120 BPM 16ths)
+    #   ~12 NPS  ->  MSD ~24       (180 BPM 16ths)
+    #   ~16 NPS  ->  MSD ~30       (fast streams)
+    #   ~20 NPS  ->  MSD ~37       (very hard)
+    msd = effective_nps * 1.7 + 3.0
+
+    return round(max(1.0, min(50.0, msd)), 2)
+
+
+def prescan_meters(sm_files: list) -> bool:
+    """
+    Pre-scan all SM files in a pack and return True if the meter values
+    appear to be corrupted (placeholder / fixed junk).
+
+    Heuristic: if >=75% of dance-single difficulties share the same meter
+    value AND that value is <= 5, the meters are considered corrupted.
+    """
+    meters: list = []
+    for sm_path in sm_files:
+        content = read_file_with_fallback(sm_path)
+        tags    = parse_sm_tags(content)
+        for notes_str in tags.get("NOTES", []):
+            info = parse_notes_block(notes_str)
+            if info and info["steps_type"] == "dance-single":
+                meters.append(info["meter"])
+
+    if not meters:
+        return False
+
+    from collections import Counter
+    counts = Counter(meters)
+    most_common_val, most_common_count = counts.most_common(1)[0]
+
+    # Corrupted if the dominant value accounts for >=75% and is suspiciously low
+    ratio = most_common_count / len(meters)
+    return ratio >= 0.75 and most_common_val <= 5
+
+
+
 
 def convert_notes(measures: list, bpms: list, stops: list, offset: float) -> list:
     """
@@ -408,6 +512,7 @@ def build_osu_content(
     timing_points:  list,
     hit_objects:    list,
     pack_name:      str = "",
+    meter_override: float = 0,
 ) -> str:
     """Assemble a complete  osu file format v14  string."""
 
@@ -443,7 +548,7 @@ def build_osu_content(
     #   with chart author:  "Song [Author's Difficulty MSD.xx]"
     #   without author:     "Song [Difficulty MSD.xx]"
     diff_name = diff_info["difficulty"]
-    meter     = diff_info["meter"]
+    meter     = meter_override if meter_override else diff_info["meter"]
 
     if chart_author:
         version = f"{song_display} [{chart_author}'s {diff_name} MSD.{meter}]"
@@ -578,10 +683,11 @@ def find_bg_file(sm_dir: str, bg_ref: str) -> tuple:
 # ---------------------------------------------------------------------------
 
 def process_sm_file(
-    sm_path:    str,
-    build_dir:  str,
-    song_index: int,
-    pack_name:  str = "",
+    sm_path:            str,
+    build_dir:          str,
+    song_index:         int,
+    pack_name:          str  = "",
+    use_estimated_msd:  bool = False,
 ) -> int:
     """
     Process one .sm file -> one or more .osu files written into *build_dir*.
@@ -661,11 +767,17 @@ def process_sm_file(
         if not hit_objects:
             continue
 
+        # Calculate estimated MSD from note density if meters are corrupted
+        meter_override = 0
+        if use_estimated_msd:
+            meter_override = estimate_msd(diff_info["measures"], bpms, stops, offset)
+
         osu_content = build_osu_content(
             metadata, diff_info,
             audio_osu_name, bg_osu_name,
             timing_points, hit_objects,
             pack_name=pack_name,
+            meter_override=meter_override,
         )
 
         # Build the .osu filename
@@ -673,7 +785,7 @@ def process_sm_file(
         subtitle = metadata["SUBTITLE"]
         full_t   = f"{title} {subtitle}".strip() if subtitle else title
         diff_n   = diff_info["difficulty"]
-        meter    = diff_info["meter"]
+        meter    = meter_override if meter_override else diff_info["meter"]
         set_title = pack_name if pack_name else full_t
 
         # Chart author fallback: description -> CREDIT -> folder name
@@ -844,13 +956,22 @@ def process_zip_pack(zip_path: str, output_dir: str) -> tuple:
             print("  [!] No .sm files found -- skipping")
             return 0, 0
 
+        # ---- pre-scan for corrupted meters ----
+        use_estimated_msd = prescan_meters(sm_files)
+        if use_estimated_msd:
+            print("  [!] Corrupted meter values detected -- using NPS-based MSD estimates")
+
         # ---- process each song ----
         total_songs = 0
         total_diffs = 0
 
         for idx, sm_path in enumerate(sm_files, start=1):
             song_folder = os.path.basename(os.path.dirname(sm_path))
-            diffs = process_sm_file(sm_path, build_dir, song_index=idx, pack_name=pack_name)
+            diffs = process_sm_file(
+                sm_path, build_dir, song_index=idx,
+                pack_name=pack_name,
+                use_estimated_msd=use_estimated_msd,
+            )
 
             if diffs > 0:
                 total_songs += 1
