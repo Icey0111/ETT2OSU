@@ -409,17 +409,32 @@ def build_osu_content(
 
     # -------------------------------------------------------------------
     # osu! uses Title/Artist from .osu metadata to name the beatmap set.
-    # To keep the set name = pack name (matching the original .zip),
-    # we set Title = pack_name and Artist = CREATOR_NAME.
-    # The individual song name goes into Version (difficulty name).
+    # Title = pack name (matching the original .zip).
+    # Artist = actual music artist from the SM file.
     # -------------------------------------------------------------------
     set_title  = pack_name if pack_name else song_display
-    set_artist = CREATOR_NAME
+    set_artist = artist
 
-    # Difficulty / Version string:  "Song Title [Difficulty MSD.xx]"
+    # Chart author fallback chain:
+    #   1) per-difficulty description from NOTES block
+    #   2) #CREDIT tag from SM header
+    #   3) author extracted from folder name, e.g. "SongName(Author)"
+    chart_author = diff_info.get("description", "").strip()
+    if not chart_author:
+        chart_author = metadata.get("CREDIT", "").strip()
+    if not chart_author:
+        chart_author = metadata.get("FOLDER_AUTHOR", "").strip()
+
+    # Difficulty / Version string:
+    #   with chart author:  "Song [Author's Difficulty MSD.xx]"
+    #   without author:     "Song [Difficulty MSD.xx]"
     diff_name = diff_info["difficulty"]
     meter     = diff_info["meter"]
-    version   = f"{song_display} [{diff_name} MSD.{meter}]"
+
+    if chart_author:
+        version = f"{song_display} [{chart_author}'s {diff_name} MSD.{meter}]"
+    else:
+        version = f"{song_display} [{diff_name} MSD.{meter}]"
 
     # Preview time
     try:
@@ -461,10 +476,10 @@ def build_osu_content(
         f"TitleUnicode:{set_title}\n"
         f"Artist:{set_artist}\n"
         f"ArtistUnicode:{set_artist}\n"
-        f"Creator:{CREATOR_NAME}\n"
+        f"Creator:{chart_author if chart_author else CREATOR_NAME}\n"
         f"Version:{version}\n"
         f"Source:{SOURCE}\n"
-        f"Tags:{TAGS}\n"
+        f"Tags:{TAGS} {chart_author}\n"
         f"BeatmapID:0\n"
         f"BeatmapSetID:-1\n"
         f"\n"
@@ -590,6 +605,13 @@ def process_sm_file(
         "SAMPLELENGTH":    tags.get("SAMPLELENGTH", ""),
     }
 
+    # Try to extract chart author from folder name, e.g. "Sally's Dance(Lofty)"
+    folder_name = os.path.basename(sm_dir)
+    folder_author = ""
+    if "(" in folder_name and folder_name.rstrip().endswith(")"):
+        folder_author = folder_name.rsplit("(", 1)[-1].rstrip(")" ).strip()
+    metadata["FOLDER_AUTHOR"] = folder_author
+
     # ---- resolve audio & background ----
     audio_path, audio_base = find_audio_file(sm_dir, tags.get("MUSIC", ""))
     bg_path,    bg_base    = find_bg_file(sm_dir, tags.get("BACKGROUND", ""))
@@ -632,8 +654,7 @@ def process_sm_file(
             pack_name=pack_name,
         )
 
-        # Build the .osu filename:
-        #   Creator - PackName [SongTitle [Difficulty MSD.xx]].osu
+        # Build the .osu filename
         title    = metadata["TITLE"]
         subtitle = metadata["SUBTITLE"]
         full_t   = f"{title} {subtitle}".strip() if subtitle else title
@@ -641,8 +662,20 @@ def process_sm_file(
         meter    = diff_info["meter"]
         set_title = pack_name if pack_name else full_t
 
+        # Chart author fallback: description -> CREDIT -> folder name
+        chart_author = diff_info.get("description", "").strip()
+        if not chart_author:
+            chart_author = metadata.get("CREDIT", "").strip()
+        if not chart_author:
+            chart_author = metadata.get("FOLDER_AUTHOR", "").strip()
+
+        if chart_author:
+            version_part = f"{full_t} [{chart_author}'s {diff_n} MSD.{meter}]"
+        else:
+            version_part = f"{full_t} [{diff_n} MSD.{meter}]"
+
         osu_fname = sanitize_filename(
-            f"{CREATOR_NAME} - {set_title} [{full_t} [{diff_n} MSD.{meter}]].osu"
+            f"{CREATOR_NAME} - {set_title} [{version_part}].osu"
         )
         osu_path = os.path.join(build_dir, osu_fname)
 
@@ -653,6 +686,101 @@ def process_sm_file(
         diff_count += 1
 
     return diff_count
+
+
+# ---------------------------------------------------------------------------
+#  Blank host difficulty generator
+# ---------------------------------------------------------------------------
+
+def create_blank_difficulty(build_dir: str, pack_name: str) -> None:
+    """
+    Create a blank .osu difficulty authored by CREATOR_NAME.
+
+    osu!'s Beatmap Submission System requires that the mapset host
+    (the Creator) has at least one difficulty in the set. This generates
+    a minimal difficulty with a single note so the set can be uploaded.
+
+    Uses the first audio and background file found in *build_dir*.
+    """
+    # Find the first audio file in build_dir
+    audio_name = ""
+    bg_name    = ""
+    for f in sorted(os.listdir(build_dir)):
+        fl = f.lower()
+        if not audio_name and fl.endswith((".mp3", ".ogg", ".wav")):
+            audio_name = f
+        if not bg_name and fl.endswith((".png", ".jpg", ".jpeg", ".bmp")):
+            bg_name = f
+        if audio_name and bg_name:
+            break
+
+    set_title  = pack_name if pack_name else "Untitled"
+    set_artist = CREATOR_NAME
+    version    = f"{CREATOR_NAME}'s Blank"
+
+    bg_escaped = bg_name.replace("\\", "/").replace('"', '\\"') if bg_name else ""
+
+    # A single tap note at 1000ms on column 0, so the map is not completely empty
+    content = (
+        f"osu file format v14\n"
+        f"\n"
+        f"[General]\n"
+        f"AudioFilename: {audio_name}\n"
+        f"AudioLeadIn: 0\n"
+        f"PreviewTime: -1\n"
+        f"Countdown: 0\n"
+        f"SampleSet: Soft\n"
+        f"StackLeniency: 0.7\n"
+        f"Mode: 3\n"
+        f"LetterboxInBreaks: 0\n"
+        f"SpecialStyle: 0\n"
+        f"WidescreenStoryboard: 0\n"
+        f"\n"
+        f"[Editor]\n"
+        f"DistanceSpacing: 1\n"
+        f"BeatDivisor: 4\n"
+        f"GridSize: 4\n"
+        f"TimelineZoom: 1\n"
+        f"\n"
+        f"[Metadata]\n"
+        f"Title:{set_title}\n"
+        f"TitleUnicode:{set_title}\n"
+        f"Artist:{set_artist}\n"
+        f"ArtistUnicode:{set_artist}\n"
+        f"Creator:{CREATOR_NAME}\n"
+        f"Version:{version}\n"
+        f"Source:{SOURCE}\n"
+        f"Tags:{TAGS}\n"
+        f"BeatmapID:0\n"
+        f"BeatmapSetID:-1\n"
+        f"\n"
+        f"[Difficulty]\n"
+        f"HPDrainRate:1\n"
+        f"CircleSize:4\n"
+        f"OverallDifficulty:1\n"
+        f"ApproachRate:5\n"
+        f"SliderMultiplier:1.4\n"
+        f"SliderTickRate:1\n"
+        f"\n"
+        f"[Events]\n"
+        f"//Background and Video events\n"
+        f'0,0,"{bg_escaped}",0,0\n'
+        f"//Break Periods\n"
+        f"\n"
+        f"[TimingPoints]\n"
+        f"0,500,4,1,0,100,1,0\n"
+        f"\n"
+        f"[HitObjects]\n"
+        f"64,192,1000,1,0,0:0:0:0:\n"
+    )
+
+    osu_fname = sanitize_filename(
+        f"{CREATOR_NAME} - {set_title} [{version}].osu"
+    )
+    osu_path = os.path.join(build_dir, osu_fname)
+
+    with open(osu_path, "w", encoding="utf-8-sig", newline="\r\n") as fh:
+        fh.write(content)
 
 
 # ---------------------------------------------------------------------------
@@ -722,6 +850,10 @@ def process_zip_pack(zip_path: str, output_dir: str) -> tuple:
             print("  [FAIL] No valid charts produced -- .osz not created")
             return 0, 0
 
+        # ---- create blank host difficulty for osu! upload ----
+        create_blank_difficulty(build_dir, pack_name)
+        print(f"  [OK] Created blank host difficulty for upload")
+
         # ---- build .osz (ZIP archive) ----
         with zipfile.ZipFile(osz_path, "w", zipfile.ZIP_DEFLATED) as zf:
             for root, _dirs, files in os.walk(build_dir):
@@ -732,7 +864,7 @@ def process_zip_pack(zip_path: str, output_dir: str) -> tuple:
 
         size_mb = os.path.getsize(osz_path) / (1024 * 1024)
         print(f"\n  [DONE] -> {pack_name}.osz  "
-              f"({total_songs} songs, {total_diffs} diffs, {size_mb:.1f} MB)")
+              f"({total_songs} songs, {total_diffs} diffs + 1 blank, {size_mb:.1f} MB)")
 
     return total_songs, total_diffs
 
