@@ -83,11 +83,25 @@ def read_file_with_fallback(filepath: str) -> str:
         return fh.read()
 
 
-def sanitize_filename(name: str) -> str:
-    """Replace characters that are illegal in Windows / osu! filenames."""
+def sanitize_filename(name: str, max_len: int = 200) -> str:
+    """Replace characters that are illegal in Windows / osu! filenames.
+
+    Also truncates to *max_len* characters to avoid exceeding the
+    Windows MAX_PATH limit (260 chars including the directory path).
+    A short hash is appended when truncation occurs to keep names unique.
+    """
     name = re.sub(r'[<>:"/\\|?*]', "_", name)
     name = re.sub(r"[\x00-\x1f]", "", name)
     name = name.strip(" .")
+
+    if len(name) > max_len:
+        import hashlib
+        h = hashlib.md5(name.encode("utf-8", errors="replace")).hexdigest()[:8]
+        base, ext = os.path.splitext(name)
+        # Reserve room for  _hash + ext
+        trim = max_len - len(ext) - 9  # 9 = underscore + 8 hex chars
+        name = base[:trim].rstrip() + "_" + h + ext
+
     return name if name else "untitled"
 
 
